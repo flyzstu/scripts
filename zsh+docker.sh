@@ -4,7 +4,7 @@ set -e
 
 echo "=================================================="
 echo "一键配置 zsh + Oh My Zsh + 自动补全插件 + Docker"
-echo "并在终端提示符前显示当前公网 IP"
+echo "+ 终端显示当前公网 IP + 默认使用 zsh"
 echo "=================================================="
 
 # 检测包管理器
@@ -123,6 +123,18 @@ else
     sudo usermod -aG docker $USER
 fi
 
+# 6. 设置默认 shell 为 zsh
+echo "[6/6] 正在将默认 shell 设置为 zsh..."
+CURRENT_SHELL=$(getent passwd $USER | cut -d: -f7)
+if [ "$CURRENT_SHELL" != "$(which zsh)" ]; then
+    echo "当前默认 shell: $CURRENT_SHELL"
+    echo "正在切换为 zsh..."
+    sudo chsh -s $(which zsh) $USER
+    echo "默认 shell 已成功切换为 zsh！"
+else
+    echo "默认 shell 已是 zsh，跳过切换。"
+fi
+
 echo "=================================================="
 echo "全部完成！"
 echo ""
@@ -130,6 +142,9 @@ echo "已完成以下操作："
 echo "  • zsh + Oh My Zsh + 补全插件"
 echo "  • Docker 安装并免 sudo"
 echo "  • 终端每次打开将显示当前公网 IP"
+echo "  • 当前用户的默认 shell 已切换为 zsh"
 echo ""
-echo "请执行： exec zsh   或重启终端"
+echo "建议操作："
+echo "  • 立即生效：exec zsh"
+echo "  • 或注销/重启系统后，新终端将直接使用 zsh"
 echo "=================================================="
