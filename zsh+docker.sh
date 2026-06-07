@@ -1,150 +1,310 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-set -e
+set -Eeuo pipefail
 
-echo "=================================================="
-echo "一键配置 zsh + Oh My Zsh + 自动补全插件 + Docker"
-echo "+ 终端显示当前公网 IP + 默认使用 zsh"
-echo "=================================================="
+SSHD_DROPIN="/etc/ssh/sshd_config.d/99-disable-password-login.conf"
+OH_MY_ZSH_INSTALL_URL="https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh"
 
-# 检测包管理器
-if command -v apt >/dev/null 2>&1; then
-    PKG_MANAGER="apt"
-    INSTALL_CMD="apt install -y"
-    UPDATE_CMD="apt update"
-elif command -v yum >/dev/null 2>&1; then
-    PKG_MANAGER="yum"
-    INSTALL_CMD="yum install -y"
-    UPDATE_CMD="yum makecache"
-elif command -v dnf >/dev/null 2>&1; then
-    PKG_MANAGER="dnf"
-    INSTALL_CMD="dnf install -y"
-    UPDATE_CMD="dnf makecache"
-elif command -v pacman >/dev/null 2>&1; then
-    PKG_MANAGER="pacman"
-    INSTALL_CMD="pacman -S --noconfirm"
-    UPDATE_CMD="pacman -Sy"
-else
-    echo "不支持的系统包管理器！"
+log() {
+    echo "[$(date +%H:%M:%S)] $*"
+}
+
+die() {
+    echo "错误：$*" >&2
     exit 1
-fi
+}
 
-# 1. 安装 zsh 和 git
-echo "[1/6] 正在安装 zsh 和 git..."
-if [ "$PKG_MANAGER" = "apt" ]; then
-    $UPDATE_CMD
-    $INSTALL_CMD zsh git curl wget
-elif [ "$PKG_MANAGER" = "yum" ] || [ "$PKG_MANAGER" = "dnf" ]; then
-    $UPDATE_CMD
-    $INSTALL_CMD zsh git curl wget
-elif [ "$PKG_MANAGER" = "pacman" ]; then
-    $UPDATE_CMD
-    $INSTALL_CMD zsh git curl wget
-fi
+require_root() {
+    if [[ ${EUID} -ne 0 ]]; then
+        die "请使用 sudo 或 root 运行：sudo bash $0"
+    fi
+}
 
-# 2. 安装 Oh My Zsh
-echo "[2/6] 正在安装 Oh My Zsh..."
-if [ ! -d "$HOME/.oh-my-zsh" ]; then
-    sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" -- --unattended
-else
-    echo "Oh My Zsh 已存在，跳过。"
-fi
+detect_target_user() {
+    TARGET_USER="${SUDO_USER:-${USER:-root}}"
+    if [[ -z "${TARGET_USER}" || "${TARGET_USER}" == "root" ]]; then
+        TARGET_USER="root"
+        TARGET_HOME="/root"
+    else
+        TARGET_HOME="$(getent passwd "${TARGET_USER}" | cut -d: -f6)"
+        [[ -n "${TARGET_HOME}" ]] || die "无法获取用户 ${TARGET_USER} 的 home 目录"
+    fi
+}
 
-# 3. 安装自动补全插件
-echo "[3/6] 正在安装 zsh-autosuggestions 和 zsh-syntax-highlighting..."
-if [ ! -d "${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-autosuggestions" ]; then
-    git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-autosuggestions
-fi
-if [ ! -d "${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting" ]; then
-    git clone https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
-fi
+run_as_target_user() {
+    if [[ "${TARGET_USER}" == "root" ]]; then
+        HOME="${TARGET_HOME}" bash -lc "$*"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo -H -u "${TARGET_USER}" bash -lc "$*"
+    else
+        su - "${TARGET_USER}" -c "$*"
+    fi
+}
 
-# 4. 配置 .zshrc（含 IP 显示）
-echo "[4/6] 正在配置 .zshrc..."
-ZSHRC="$HOME/.zshrc"
-if [ -f "$ZSHRC" ]; then
-    cp "$ZSHRC" "${ZSHRC}.backup.$(date +%Y%m%d_%H%M%S)"
-    echo "已备份原 .zshrc"
-fi
+detect_pkg_manager() {
+    if command -v apt-get >/dev/null 2>&1; then
+        PKG_MANAGER="apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        PKG_MANAGER="dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        PKG_MANAGER="yum"
+    elif command -v pacman >/dev/null 2>&1; then
+        PKG_MANAGER="pacman"
+    else
+        die "不支持的系统包管理器（需要 apt、dnf、yum 或 pacman）"
+    fi
+}
 
-cat > "$ZSHRC" << 'EOF'
+pkg_update() {
+    case "${PKG_MANAGER}" in
+        apt) DEBIAN_FRONTEND=noninteractive apt-get update ;;
+        dnf) dnf makecache -y ;;
+        yum) yum makecache -y ;;
+        pacman) pacman -Sy --noconfirm ;;
+    esac
+}
+
+pkg_install() {
+    case "${PKG_MANAGER}" in
+        apt) DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+        dnf) dnf install -y "$@" ;;
+        yum) yum install -y "$@" ;;
+        pacman) pacman -S --noconfirm --needed "$@" ;;
+    esac
+}
+
+install_base_packages() {
+    log "[1/7] 安装基础软件：git、zsh、curl、wget"
+    pkg_update
+    case "${PKG_MANAGER}" in
+        apt) pkg_install git zsh curl wget ca-certificates gnupg lsb-release ;;
+        dnf|yum) pkg_install git zsh curl wget ca-certificates ;;
+        pacman) pkg_install git zsh curl wget ca-certificates ;;
+    esac
+}
+
+configure_sshd_password_login() {
+    log "[2/7] 配置 sshd：禁用密码登录"
+
+    local main_conf="/etc/ssh/sshd_config"
+    install -d -m 755 /etc/ssh/sshd_config.d
+    if [[ -f "${main_conf}" ]] && ! grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "${main_conf}"; then
+        local tmp_conf
+        tmp_conf="$(mktemp)"
+        cp "${main_conf}" "${main_conf}.backup.$(date +%Y%m%d_%H%M%S)"
+        {
+            echo "Include /etc/ssh/sshd_config.d/*.conf"
+            cat "${main_conf}"
+        } > "${tmp_conf}"
+        cat "${tmp_conf}" > "${main_conf}"
+        rm -f "${tmp_conf}"
+    fi
+
+    if [[ -f "${SSHD_DROPIN}" ]]; then
+        cp "${SSHD_DROPIN}" "${SSHD_DROPIN}.backup.$(date +%Y%m%d_%H%M%S)"
+    fi
+
+    cat > "${SSHD_DROPIN}" <<'EOF'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+UsePAM yes
+EOF
+    chmod 644 "${SSHD_DROPIN}"
+
+    if command -v sshd >/dev/null 2>&1; then
+        sshd -t
+    else
+        log "未找到 sshd 命令，已写入配置，跳过语法检查和服务重载。"
+        return
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl list-unit-files sshd.service >/dev/null 2>&1; then
+            systemctl reload sshd || systemctl restart sshd
+        elif systemctl list-unit-files ssh.service >/dev/null 2>&1; then
+            systemctl reload ssh || systemctl restart ssh
+        else
+            log "未找到 sshd/ssh systemd 服务，已写入配置，跳过服务重载。"
+        fi
+    elif command -v service >/dev/null 2>&1; then
+        service sshd reload 2>/dev/null || service ssh reload 2>/dev/null || log "无法自动重载 sshd，请手动重启服务。"
+    else
+        log "未找到服务管理器，请手动重启 sshd。"
+    fi
+}
+
+install_oh_my_zsh() {
+    log "[3/7] 安装 Oh My Zsh 到 ${TARGET_HOME}"
+
+    if [[ -d "${TARGET_HOME}/.oh-my-zsh" ]]; then
+        log "Oh My Zsh 已存在，跳过。"
+        return
+    fi
+
+    run_as_target_user "RUNZSH=no CHSH=no KEEP_ZSHRC=yes sh -c \"\$(curl -fsSL ${OH_MY_ZSH_INSTALL_URL})\" -- --unattended"
+}
+
+clone_or_update_plugin() {
+    local repo="$1"
+    local dir="$2"
+
+    if [[ -d "${dir}/.git" ]]; then
+        run_as_target_user "git -C '${dir}' pull --ff-only"
+    elif [[ -d "${dir}" ]]; then
+        log "${dir} 已存在但不是 git 仓库，跳过。"
+    else
+        run_as_target_user "git clone --depth=1 '${repo}' '${dir}'"
+    fi
+}
+
+install_zsh_plugins() {
+    log "[4/7] 安装常见 Oh My Zsh 插件"
+
+    local custom_dir="${TARGET_HOME}/.oh-my-zsh/custom"
+    local plugin_dir="${custom_dir}/plugins"
+    install -d -m 755 -o "${TARGET_USER}" -g "$(id -gn "${TARGET_USER}")" "${plugin_dir}"
+
+    clone_or_update_plugin "https://github.com/zsh-users/zsh-autosuggestions.git" "${plugin_dir}/zsh-autosuggestions"
+    clone_or_update_plugin "https://github.com/zsh-users/zsh-syntax-highlighting.git" "${plugin_dir}/zsh-syntax-highlighting"
+    clone_or_update_plugin "https://github.com/zsh-users/zsh-completions.git" "${plugin_dir}/zsh-completions"
+    clone_or_update_plugin "https://github.com/zsh-users/zsh-history-substring-search.git" "${plugin_dir}/zsh-history-substring-search"
+    clone_or_update_plugin "https://github.com/MichaelAquilina/zsh-you-should-use.git" "${plugin_dir}/you-should-use"
+}
+
+write_zshrc() {
+    log "[5/7] 写入 ${TARGET_HOME}/.zshrc"
+
+    local zshrc="${TARGET_HOME}/.zshrc"
+    if [[ -f "${zshrc}" ]]; then
+        cp "${zshrc}" "${zshrc}.backup.$(date +%Y%m%d_%H%M%S)"
+    fi
+
+    cat > "${zshrc}" <<'EOF'
 export ZSH="$HOME/.oh-my-zsh"
 
 ZSH_THEME="robbyrussell"
 
 plugins=(
-    git
-    zsh-autosuggestions
-    zsh-syntax-highlighting
-    docker
-    sudo
-    extract
+  git
+  docker
+  docker-compose
+  sudo
+  extract
+  colored-man-pages
+  command-not-found
+  zsh-completions
+  zsh-autosuggestions
+  zsh-history-substring-search
+  you-should-use
+  zsh-syntax-highlighting
 )
 
-source $ZSH/oh-my-zsh.sh
+source "$ZSH/oh-my-zsh.sh"
 
-# 在命令执行前显示当前公网 IP（仅在新会话或未显示时）
-precmd_show_ip() {
-    [[ -o interactive ]] || return
-    if [[ "$LAST_IP_SHOWN" != "$PROMPT" ]]; then
-        echo -n "当前公网 IP: "
-        IP=$(curl -s --connect-timeout 3 https://api.ipify.org 2>/dev/null || \
-             curl -s --connect-timeout 3 https://ifconfig.me 2>/dev/null || \
-             curl -s --connect-timeout 3 https://ipinfo.io/ip 2>/dev/null || \
-             echo "获取失败")
-        echo "$IP"
-        LAST_IP_SHOWN="$PROMPT"
-    fi
-}
-precmd_functions+=(precmd_show_ip)
+autoload -U compinit && compinit
 EOF
 
-# 5. 安装 Docker
-echo "[5/6] 正在安装 Docker..."
-if command -v docker >/dev/null 2>&1; then
-    echo "Docker 已安装，跳过。"
-else
-    if [ "$PKG_MANAGER" = "apt" ]; then
-        $UPDATE_CMD
-        $INSTALL_CMD ca-certificates curl gnupg lsb-release
-        sudo mkdir -p /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/$(. /etc/os-release && echo "$ID")/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$(. /etc/os-release && echo "$ID") $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-        $UPDATE_CMD
-        $INSTALL_CMD docker-ce docker-ce-cli containerd.io docker-compose-plugin
-    elif [ "$PKG_MANAGER" = "yum" ] || [ "$PKG_MANAGER" = "dnf" ]; then
-        $INSTALL_CMD yum-utils
-        sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-        $INSTALL_CMD docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-    elif [ "$PKG_MANAGER" = "pacman" ]; then
-        $INSTALL_CMD docker
+    chown "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "${zshrc}"
+    chmod 644 "${zshrc}"
+}
+
+install_docker() {
+    log "[6/7] 安装 Docker"
+
+    if command -v docker >/dev/null 2>&1; then
+        log "Docker 已安装，跳过安装。"
+    else
+        case "${PKG_MANAGER}" in
+            apt)
+                install -d -m 0755 /etc/apt/keyrings
+                . /etc/os-release
+                local docker_id="${ID}"
+                local docker_codename="${VERSION_CODENAME:-}"
+                if [[ "${ID}" != "ubuntu" && "${ID}" != "debian" ]]; then
+                    die "Docker 官方 apt 仓库仅在此脚本中支持 Debian/Ubuntu，当前系统为 ${ID}"
+                fi
+                if [[ -z "${docker_codename}" ]] && command -v lsb_release >/dev/null 2>&1; then
+                    docker_codename="$(lsb_release -cs)"
+                fi
+                [[ -n "${docker_codename}" ]] || die "无法识别 Debian/Ubuntu 发行版代号"
+                curl -fsSL "https://download.docker.com/linux/${docker_id}/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+                chmod a+r /etc/apt/keyrings/docker.gpg
+                echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${docker_id} ${docker_codename} stable" > /etc/apt/sources.list.d/docker.list
+                pkg_update
+                pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+                ;;
+            dnf)
+                pkg_install dnf-plugins-core
+                dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+                pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+                ;;
+            yum)
+                pkg_install yum-utils
+                yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+                pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+                ;;
+            pacman)
+                pkg_install docker docker-compose
+                ;;
+        esac
     fi
-    sudo systemctl enable --now docker
-    sudo usermod -aG docker $USER
-fi
 
-# 6. 设置默认 shell 为 zsh
-echo "[6/6] 正在将默认 shell 设置为 zsh..."
-CURRENT_SHELL=$(getent passwd $USER | cut -d: -f7)
-if [ "$CURRENT_SHELL" != "$(which zsh)" ]; then
-    echo "当前默认 shell: $CURRENT_SHELL"
-    echo "正在切换为 zsh..."
-    sudo chsh -s $(which zsh) $USER
-    echo "默认 shell 已成功切换为 zsh！"
-else
-    echo "默认 shell 已是 zsh，跳过切换。"
-fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl enable --now docker
+    else
+        log "未找到 systemctl，请手动启动 Docker 服务。"
+    fi
 
-echo "=================================================="
-echo "全部完成！"
-echo ""
-echo "已完成以下操作："
-echo "  • zsh + Oh My Zsh + 补全插件"
-echo "  • Docker 安装并免 sudo"
-echo "  • 终端每次打开将显示当前公网 IP"
-echo "  • 当前用户的默认 shell 已切换为 zsh"
-echo ""
-echo "建议操作："
-echo "  • 立即生效：exec zsh"
-echo "  • 或注销/重启系统后，新终端将直接使用 zsh"
-echo "=================================================="
+    if getent group docker >/dev/null 2>&1 && [[ "${TARGET_USER}" != "root" ]]; then
+        usermod -aG docker "${TARGET_USER}"
+    fi
+}
+
+set_default_shell() {
+    log "[7/7] 设置 ${TARGET_USER} 默认 shell 为 zsh"
+
+    local zsh_path
+    zsh_path="$(command -v zsh)"
+    if ! grep -qxF "${zsh_path}" /etc/shells; then
+        echo "${zsh_path}" >> /etc/shells
+    fi
+
+    local current_shell
+    current_shell="$(getent passwd "${TARGET_USER}" | cut -d: -f7)"
+    if [[ "${current_shell}" == "${zsh_path}" ]]; then
+        log "默认 shell 已是 zsh，跳过。"
+    else
+        chsh -s "${zsh_path}" "${TARGET_USER}"
+    fi
+}
+
+main() {
+    echo "=================================================="
+    echo "一键配置 SSHD + Git + Zsh + Oh My Zsh + Docker"
+    echo "=================================================="
+
+    require_root
+    detect_target_user
+    detect_pkg_manager
+
+    log "目标用户：${TARGET_USER} (${TARGET_HOME})"
+    log "包管理器：${PKG_MANAGER}"
+
+    install_base_packages
+    configure_sshd_password_login
+    install_oh_my_zsh
+    install_zsh_plugins
+    write_zshrc
+    install_docker
+    set_default_shell
+
+    echo "=================================================="
+    echo "全部完成。"
+    echo "已禁用 sshd 密码登录；请确认 SSH key 登录可用后再断开当前会话。"
+    echo "Docker 免 sudo 需要重新登录或执行：newgrp docker"
+    echo "Zsh 立即生效可执行：exec zsh"
+    echo "=================================================="
+}
+
+main "$@"
