@@ -53,3 +53,16 @@ exec zsh
 
 仓库同时包含 `sing-box.sh`，用于安装或更新 sing-box 二进制和 systemd 服务。
 
+## Ansible 作业
+
+`ansible/docker-auto-update.yml` 会在 Docker 主机上安装一个 systemd timer，定时用 Watchtower 自动更新 Docker 镜像和容器。
+
+```bash
+ansible-playbook -i ansible/inventory.ini ansible/docker-auto-update.yml
+```
+
+`ansible/brutal-kernel.yml` 会在 Linux 主机上执行 `bash <(curl -fsSL https://tcp.hy2.sh/)`，安装并启用内核 TCP Brutal。
+
+```bash
+ansible-playbook -i ansible/inventory.ini ansible/brutal-kernel.yml
+```

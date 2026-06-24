@@ -1,0 +1,60 @@
+---
+- name: Enable kernel TCP Brutal
+  hosts: docker_hosts
+  become: true
+  vars:
+    brutal_install_url: https://tcp.hy2.sh/
+    brutal_force_install: false
+    brutal_set_default: false
+
+  tasks:
+    - name: Ensure bash and curl are installed
+      ansible.builtin.package:
+        name:
+          - bash
+          - curl
+        state: present
+
+    - name: Read available TCP congestion controls
+      ansible.builtin.command: cat /proc/sys/net/ipv4/tcp_available_congestion_control
+      register: tcp_available_congestion_control
+      changed_when: false
+
+    - name: Install TCP Brutal kernel module
+      ansible.builtin.shell: bash <(curl -fsSL "{{ brutal_install_url }}")
+      args:
+        executable: /bin/bash
+      when: brutal_force_install | bool or "'brutal' not in tcp_available_congestion_control.stdout.split()"
+
+    - name: Load TCP Brutal module if available
+      ansible.builtin.command: modprobe tcp_brutal
+      register: brutal_modprobe
+      failed_when: false
+      changed_when: brutal_modprobe.rc == 0
+
+    - name: Re-read available TCP congestion controls
+      ansible.builtin.command: cat /proc/sys/net/ipv4/tcp_available_congestion_control
+      register: brutal_available_after_install
+      changed_when: false
+
+    - name: Assert TCP Brutal is available
+      ansible.builtin.assert:
+        that:
+          - "'brutal' in brutal_available_after_install.stdout.split()"
+        fail_msg: "TCP Brutal is not available after installation. Check kernel headers, DKMS/build logs, and installer output."
+        success_msg: "TCP Brutal is available."
+
+    - name: Persist Brutal as default TCP congestion control
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-tcp-brutal.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          net.ipv4.tcp_congestion_control = brutal
+      when: brutal_set_default | bool
+
+    - name: Apply Brutal as default TCP congestion control
+      ansible.builtin.command: sysctl -w net.ipv4.tcp_congestion_control=brutal
+      changed_when: true
+      when: brutal_set_default | bool

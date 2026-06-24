@@ -1,0 +1,93 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etcd-backup
+  namespace: kube-system
+spec:
+  schedule: "0 2 * * *"
+  timeZone: Asia/Shanghai
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 1800
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: etcd-backup
+        spec:
+          restartPolicy: OnFailure
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+
+          # 必须调度到运行 etcd 的 k0s controller 节点。
+          # 执行 `kubectl get nodes -o wide` 获取节点名后替换。
+          nodeSelector:
+            kubernetes.io/hostname: CHANGE_ME
+
+          containers:
+            - name: etcd-backup
+              # 建议修改为与集群 etcd 主版本、次版本一致的镜像。
+              image: quay.io/coreos/etcd:v3.5.21
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  timestamp="$(date +%Y%m%d-%H%M%S)"
+                  snapshot="/backup/etcd-snapshot-${timestamp}.db"
+
+                  echo "Creating etcd snapshot: ${snapshot}"
+
+                  ETCDCTL_API=3 etcdctl \
+                    --endpoints=https://127.0.0.1:2379 \
+                    --cacert=/etc/k0s-etcd/ca.crt \
+                    --cert=/etc/k0s-etcd/server.crt \
+                    --key=/etc/k0s-etcd/server.key \
+                    snapshot save "${snapshot}"
+
+                  etcdutl snapshot status "${snapshot}" --write-out=table
+
+                  # 删除 14 天前的本地快照。
+                  find /backup \
+                    -type f \
+                    -name 'etcd-snapshot-*.db' \
+                    -mtime +14 \
+                    -delete
+
+                  echo "Snapshot completed: ${snapshot}"
+              securityContext:
+                runAsUser: 0
+                runAsGroup: 0
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: "1"
+                  memory: 512Mi
+              volumeMounts:
+                - name: etcd-certs
+                  mountPath: /etc/k0s-etcd
+                  readOnly: true
+                - name: backup
+                  mountPath: /backup
+
+          volumes:
+            - name: etcd-certs
+              hostPath:
+                path: /var/lib/k0s/pki/etcd
+                type: Directory
+            - name: backup
+              hostPath:
+                path: /backup/etcd
+                type: DirectoryOrCreate

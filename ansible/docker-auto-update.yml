@@ -1,0 +1,84 @@
+---
+- name: Install Docker image auto update job
+  hosts: docker_hosts
+  become: true
+  vars:
+    watchtower_image: containrrr/watchtower:latest
+    watchtower_schedule: daily
+    watchtower_cleanup: true
+    watchtower_label_enable: false
+    watchtower_timeout: 300s
+    watchtower_service_name: docker-image-auto-update
+
+  tasks:
+    - name: Find Docker CLI path
+      ansible.builtin.shell: command -v docker
+      register: docker_cli
+      changed_when: false
+
+    - name: Ensure Docker CLI works
+      ansible.builtin.command: "{{ docker_cli.stdout }} --version"
+      changed_when: false
+
+    - name: Install Watchtower one-shot systemd service
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ watchtower_service_name }}.service"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Auto update Docker images and containers with Watchtower
+          Requires=docker.service
+          After=docker.service network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStartPre=-{{ docker_cli.stdout }} pull {{ watchtower_image }}
+          ExecStart={{ docker_cli.stdout }} run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+          {% if watchtower_label_enable %}
+            --label-enable \
+          {% endif %}
+          {% if watchtower_cleanup %}
+            --cleanup \
+          {% endif %}
+            --stop-timeout {{ watchtower_timeout }} \
+            {{ watchtower_image }} \
+            --run-once
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Reload systemd
+
+    - name: Install Watchtower systemd timer
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ watchtower_service_name }}.timer"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Run Docker image auto update job {{ watchtower_schedule }}
+
+          [Timer]
+          OnCalendar={{ watchtower_schedule }}
+          Persistent=true
+          Unit={{ watchtower_service_name }}.service
+
+          [Install]
+          WantedBy=timers.target
+      notify: Reload systemd
+
+    - name: Enable and start auto update timer
+      ansible.builtin.systemd:
+        name: "{{ watchtower_service_name }}.timer"
+        enabled: true
+        state: started
+        daemon_reload: true
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
